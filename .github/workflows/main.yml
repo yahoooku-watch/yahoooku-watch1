@@ -2,7 +2,7 @@ name: Yahuoku Watch1
 
 on:
   schedule:
-    - cron: "0,10,20,30,40,50 * * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -10,12 +10,12 @@ permissions:
 
 concurrency:
   group: yahuoku-watch1
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repository
@@ -56,7 +56,6 @@ jobs:
             .map(s => s.trim())
             .filter(Boolean);
 
-          // 1行目の header を削除
           lines.shift();
 
           const targets = lines.map(l => {
@@ -98,13 +97,6 @@ jobs:
 
             const q = encodeURIComponent(t.keyword);
 
-            // スクショの画面と同じ条件
-            // fixed=2              → オークション
-            // is_postage_mode=1    → 送料を表示
-            // dest_pref_code=11    → 埼玉県
-            // n=50                 → 50件表示
-            // s1=end&o1=d          → 残り時間の長い順
-            // auchours=4           → 4時間以内
             const searchUrl =
               `https://auctions.yahoo.co.jp/search/search?p=${q}&va=${q}&fixed=2&is_postage_mode=1&dest_pref_code=11&b=1&n=50&s1=end&o1=d&auchours=4`;
 
@@ -185,7 +177,6 @@ jobs:
               continue;
             }
 
-            // Yahoo側で「4時間以内」かつ「残り時間の長い順」にしているので先頭を対象にする
             const item = filtered[0];
 
             console.log(`✅ 取得成功: ${t.name} ¥${item.price} ${item.url}`);
