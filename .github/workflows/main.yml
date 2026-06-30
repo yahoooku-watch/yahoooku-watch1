@@ -21,18 +21,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Guard - skip if ran within 25min
-        run: |
-          NOW=$(date -u +%s)
-          LAST=0
-          if [ -f .github/yahuoku_last_run_utc.txt ]; then LAST=$(cat .github/yahuoku_last_run_utc.txt || echo 0); fi
-          DIFF=$((NOW - LAST))
-          echo "Last run diff(sec): $DIFF"
-          if [ $DIFF -lt 1500 ]; then
-            echo "Run skipped (last run $DIFF sec ago)."
-            exit 0
-          fi
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -189,9 +177,6 @@ jobs:
               continue;
             }
 
-            // Yahoo側のURL条件：
-            // auchours=5 → 終了5時間以内
-            // s1=end&o1=d → 残り時間の長い順
             const item = filtered[0];
 
             console.log(`✅ 取得成功: ${t.name} ¥${item.price} ${item.url}`);
@@ -283,13 +268,8 @@ jobs:
 
       - name: Save state
         run: |
-          mkdir -p .github
-          date -u +%s > .github/yahuoku_last_run_utc.txt
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add .github/yahuoku_last_run_utc.txt
 
           if [ -f yahuoku_last_seen.json ]; then
             git add yahuoku_last_seen.json
