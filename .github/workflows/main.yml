@@ -1,38 +1,303 @@
-name: Yahuoku Watch
+name: Yahuoku Watch1
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "0,10,20,30,40,50 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: yahuoku-watch1
+  cancel-in-progress: true
+
 jobs:
-  watch:
+  check:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - run: |
-          pip install playwright
-          playwright install chromium
-
-      - run: python watch_yahuoku.py
-        env:
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
-
-      - name: Commit state
+      - name: Guard - skip if ran within 25min
         run: |
+          NOW=$(date -u +%s)
+          LAST=0
+          if [ -f .github/yahuoku_last_run_utc.txt ]; then LAST=$(cat .github/yahuoku_last_run_utc.txt || echo 0); fi
+          DIFF=$((NOW - LAST))
+          echo "Last run diff(sec): $DIFF"
+          if [ $DIFF -lt 1500 ]; then
+            echo "Run skipped (last run $DIFF sec ago)."
+            exit 0
+          fi
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install npm deps
+        run: |
+          npm i nodemailer
+          npm i -D playwright
+          npx playwright install --with-deps chromium
+
+      - name: Run Yahuoku Watcher
+        env:
+          GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          node <<'EOF'
+          import fs from 'fs';
+          import nodemailer from 'nodemailer';
+          import { chromium } from 'playwright';
+
+          const csvPath = 'targets.csv';
+
+          if (!fs.existsSync(csvPath)) {
+            console.log('targets.csv がありません。');
+            process.exit(0);
+          }
+
+          const lines = fs.readFileSync(csvPath, 'utf8')
+            .split('\n')
+            .map(s => s.trim())
+            .filter(Boolean);
+
+          lines.shift();
+
+          const targets = lines.map(l => {
+            const [name, keyword] = l.split(',');
+            return {
+              name: name?.trim(),
+              keyword: keyword?.trim()
+            };
+          });
+
+          const seenPath = 'yahuoku_last_seen.json';
+          let seen = {};
+
+          try {
+            seen = JSON.parse(fs.readFileSync(seenPath, 'utf8'));
+          } catch {}
+
+          const browser = await chromium.launch({ headless: true });
+
+          const page = await browser.newPage({
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+          });
+
+          const foundMsgs = [];
+
+          function normalize(s) {
+            return String(s || '')
+              .toLowerCase()
+              .replace(/[ 　]/g, '')
+              .replace(/[‐-‒–—―ー]/g, '-');
+          }
+
+          function keywordHit(title, keyword) {
+            return normalize(title).includes(normalize(keyword));
+          }
+
+          for (const t of targets) {
+            if (!t.keyword) continue;
+
+            const q = encodeURIComponent(t.keyword);
+
+            const searchUrl =
+              `https://auctions.yahoo.co.jp/search/search?p=${q}&va=${q}&fixed=2&is_postage_mode=1&dest_pref_code=11&b=1&n=50&s1=end&o1=d&auchours=5`;
+
+            console.log(`🔎 Checking Yahuoku: ${t.name}`);
+            console.log(searchUrl);
+
+            try {
+              await page.goto(searchUrl, {
+                waitUntil: 'domcontentloaded',
+                timeout: 120000
+              });
+
+              await page.waitForTimeout(6000);
+            } catch (e) {
+              console.log(`⚠️ ${t.name}: ページ遷移エラー (${e?.message || e})`);
+              continue;
+            }
+
+            const items = await page.evaluate(() => {
+              const anchors = [...document.querySelectorAll('a[href*="/jp/auction/"]')];
+              const results = [];
+
+              for (const a of anchors) {
+                const href = a.href.split('?')[0];
+
+                if (!href || !href.includes('/jp/auction/')) continue;
+
+                let block = a;
+
+                for (let i = 0; i < 10; i++) {
+                  if (!block.parentElement) break;
+
+                  const txt = block.innerText || '';
+
+                  if (
+                    txt.includes('現在') &&
+                    txt.includes('円') &&
+                    (txt.includes('時間') || txt.includes('分'))
+                  ) {
+                    break;
+                  }
+
+                  block = block.parentElement;
+                }
+
+                const blockText = block.innerText || a.innerText || '';
+                const title = (a.innerText || '').trim();
+
+                const priceMatch =
+                  blockText.match(/現在\s*([\d,]+)円/) ||
+                  blockText.match(/([\d,]+)\s*円/);
+
+                if (!priceMatch) continue;
+
+                const id = href.split('/').filter(Boolean).pop() || href;
+                const price = parseInt(priceMatch[1].replace(/,/g, ''), 10);
+
+                if (!results.some(x => x.id === id)) {
+                  results.push({
+                    id,
+                    url: href,
+                    price,
+                    title,
+                    text: blockText
+                  });
+                }
+              }
+
+              return results;
+            });
+
+            const filtered = items.filter(item => {
+              return keywordHit(item.title || item.text, t.keyword);
+            });
+
+            if (!filtered.length) {
+              console.log(`⚠️ ${t.name}: ヒット0件 or 取得失敗`);
+              continue;
+            }
+
+            // Yahoo側のURL条件：
+            // auchours=5 → 終了5時間以内
+            // s1=end&o1=d → 残り時間の長い順
+            const item = filtered[0];
+
+            console.log(`✅ 取得成功: ${t.name} ¥${item.price} ${item.url}`);
+
+            const isNew = seen[t.name] !== item.id;
+
+            if (isNew) {
+              foundMsgs.push({
+                name: t.name,
+                title: item.title,
+                price: item.price,
+                url: item.url,
+                searchUrl,
+                id: item.id,
+                prev: seen[t.name] || ''
+              });
+
+              seen[t.name] = item.id;
+            } else {
+              if (!seen[t.name]) {
+                seen[t.name] = item.id;
+              }
+            }
+          }
+
+          await browser.close();
+
+          const linesOut = [];
+
+          if (foundMsgs.length) {
+            linesOut.push('## 🛎 ヤフオク新着検出\n');
+
+            for (const x of foundMsgs) {
+              linesOut.push(`- **${x.name}** 新着: ¥${x.price.toLocaleString()} → ${x.url}`);
+            }
+          } else {
+            linesOut.push('ヤフオク新着はありません。');
+          }
+
+          fs.appendFileSync(
+            process.env.GITHUB_STEP_SUMMARY || 'summary.md',
+            linesOut.join('\n')
+          );
+
+          if (foundMsgs.length) {
+            const user = process.env.MAIL_USERNAME;
+            const pass = process.env.MAIL_PASSWORD;
+            const to = process.env.MAIL_TO || user;
+
+            if (user && pass) {
+              const transporter = nodemailer.createTransport({
+                host: 'smtp.gmail.com',
+                port: 465,
+                secure: true,
+                auth: {
+                  user,
+                  pass
+                }
+              });
+
+              const text = foundMsgs.map(x =>
+                [
+                  `【${x.name}】¥${x.price.toLocaleString()}`,
+                  `タイトル: ${x.title}`,
+                  `検索結果: ${x.searchUrl}`,
+                  `商品詳細: ${x.url}`,
+                  `new:${x.id} prev:${x.prev}`,
+                  ''
+                ].join('\n')
+              ).join('\n');
+
+              await transporter.sendMail({
+                from: user,
+                to,
+                subject: `ヤフオク 新着 ${foundMsgs.length}件`,
+                text
+              });
+
+              console.log('📧 Gmail 送信 OK');
+            } else {
+              console.log('📧 MAIL_USERNAME / MAIL_PASSWORD が未設定');
+            }
+          }
+
+          fs.writeFileSync(seenPath, JSON.stringify(seen, null, 2));
+
+          console.log('Yahuoku Watch 完了');
+          EOF
+
+      - name: Save state
+        run: |
+          mkdir -p .github
+          date -u +%s > .github/yahuoku_last_run_utc.txt
+
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add yahuoku_last_seen.json
-          git commit -m "update state" || echo "No changes"
-          git push
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .github/yahuoku_last_run_utc.txt
+
+          if [ -f yahuoku_last_seen.json ]; then
+            git add yahuoku_last_seen.json
+          fi
+
+          if git diff --cached --quiet; then
+            echo "no state changes"
+          else
+            git commit -m "chore: update yahuoku state"
+            git push
+          fi
